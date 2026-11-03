@@ -1,18 +1,20 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  SizeTree disk analysis for Windows Server 2016 and later (Windows PowerShell 5.1).
+  disk-space-analysis disk analysis for Windows Server 2016 and later (Windows PowerShell 5.1).
 
 .DESCRIPTION
-  Scans a folder, volume, or UNC path and writes a Tree Size style report:
+  Scans one or more folders, volumes, or UNC paths and writes a Tree Size style report:
   folder tree, largest files, extension mix, age, optional duplicates, and
-  access errors. Open latest.json in the SizeTree viewer.
+  access errors. Open latest.json in the disk-space-analysis viewer, or double-click
+  latest.html for the same screen offline.
 
   Junctions and symlinks are not followed. -AllocatedSize reads NTFS
   allocation (compression and sparse files included) and is slower.
 
 .PARAMETER Path
-  Directory to scan. Local path or UNC.
+  One or more directories. Local paths or UNC. Separate with commas:
+  -Path D:\,E:\Shares
 
 .PARAMETER OutDir
   Report folder. Stamped copies plus latest.* files are written here.
@@ -25,13 +27,13 @@
   and in folders.csv, but are not expandable in the viewer.
 
 .EXAMPLE
-  .\Get-DiskAnalysis.ps1 -Path D:\ -OutDir C:\SizeTreeReports -Duplicates -HashDuplicates -AllocatedSize
+  .\Get-DiskAnalysis.ps1 -Path D:\,E:\ -OutDir C:\disk-space-analysis-reports -Duplicates -HashDuplicates -AllocatedSize
 #>
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true, Position = 0)]
-  [string]$Path,
-  [string]$OutDir = '.\SizeTreeReports',
+  [string[]]$Path,
+  [string]$OutDir = '.\disk-space-analysis-reports',
   [int]$TopFiles = 200,
   [int]$TopFolders = 500,
   [int]$Depth = 0,
@@ -63,6 +65,12 @@ $script:FilesSeen = 0
 $script:Errors = New-Object System.Collections.Generic.List[object]
 $script:Ext = @{}
 $script:Age = @{}
+$script:AgeFiles = @{}
+$script:AgeFileMin = @{}
+$script:AgeFileCap = 40
+$script:ExtFiles = @{}
+$script:ExtFileMin = @{}
+$script:ExtFileCap = 40
 $script:LargeFiles = New-Object System.Collections.Generic.List[object]
 $script:TopMin = [int64]-1
 $script:Dup = @{}
@@ -126,6 +134,48 @@ function Update-TopMin {
   $script:TopMin = $min
 }
 
+function Add-CappedFile($Bag, $Mins, [int]$Cap, [string]$Key, $FileRow) {
+  if (-not $Bag.ContainsKey($Key)) {
+    $Bag[$Key] = New-Object System.Collections.Generic.List[object]
+    $Mins[$Key] = [int64]-1
+  }
+  $list = $Bag[$Key]
+  $size = [int64]$FileRow.logicalBytes
+  if ($list.Count -lt $Cap) {
+    [void]$list.Add($FileRow)
+    if ($list.Count -eq $Cap) {
+      $min = [int64]$list[0].logicalBytes
+      for ($i = 1; $i -lt $list.Count; $i++) {
+        if ([int64]$list[$i].logicalBytes -lt $min) { $min = [int64]$list[$i].logicalBytes }
+      }
+      $Mins[$Key] = $min
+    }
+    return
+  }
+  if ($size -le [int64]$Mins[$Key]) { return }
+  $minIdx = 0
+  $minVal = [int64]$list[0].logicalBytes
+  for ($i = 1; $i -lt $list.Count; $i++) {
+    $value = [int64]$list[$i].logicalBytes
+    if ($value -lt $minVal) { $minVal = $value; $minIdx = $i }
+  }
+  $list.RemoveAt($minIdx)
+  [void]$list.Add($FileRow)
+  $min = [int64]$list[0].logicalBytes
+  for ($i = 1; $i -lt $list.Count; $i++) {
+    if ([int64]$list[$i].logicalBytes -lt $min) { $min = [int64]$list[$i].logicalBytes }
+  }
+  $Mins[$Key] = $min
+}
+
+function Add-AgeFile([string]$Bucket, $FileRow) {
+  Add-CappedFile $script:AgeFiles $script:AgeFileMin $script:AgeFileCap $Bucket $FileRow
+}
+
+function Add-ExtFile([string]$Extension, $FileRow) {
+  Add-CappedFile $script:ExtFiles $script:ExtFileMin $script:ExtFileCap $Extension $FileRow
+}
+
 function Add-LargeFile($FileRow) {
   $size = [int64]$FileRow.logicalBytes
   if ($script:LargeFiles.Count -lt $TopFiles) {
@@ -162,11 +212,11 @@ function Get-DisplayPath([string]$FullName) {
   return $FullName
 }
 
-if ($AllocatedSize -and -not ('SizeTreeNative.Alloc' -as [type])) {
+if ($AllocatedSize -and -not ('DiskSpaceNative.Alloc' -as [type])) {
   $native = @'
 using System;
 using System.Runtime.InteropServices;
-namespace SizeTreeNative {
+namespace DiskSpaceNative {
   public static class Alloc {
     const uint FILE_READ_ATTRIBUTES = 0x80;
     const uint SHARE_ALL = 7;
@@ -207,7 +257,7 @@ namespace SizeTreeNative {
 function Get-Allocated([string]$FullName, [int64]$Logical) {
   if (-not $AllocatedSize) { return $Logical }
   try {
-    $value = [int64][SizeTreeNative.Alloc]::GetAllocation((Get-ApiPath $FullName))
+    $value = [int64][DiskSpaceNative.Alloc]::GetAllocation((Get-ApiPath $FullName))
     if ($value -ge 0) { return $value }
   } catch { }
   return $Logical
@@ -259,26 +309,14 @@ function Update-Rollup($Root) {
   }
 }
 
-try {
-  $fullRoot = [System.IO.Path]::GetFullPath($Path)
-} catch {
-  Write-Host "Path is not valid: $Path"
-  exit 2
-}
-$probe = New-Object System.IO.DirectoryInfo $fullRoot
-if (-not $probe.Exists) {
-  Write-Host "Path not found or not a directory: $fullRoot"
-  exit 2
+function Add-Depth($Node, [int]$Delta) {
+  $Node.Depth = [int]$Node.Depth + $Delta
+  foreach ($next in @($Node.Children)) { Add-Depth $next $Delta }
 }
 
-$rootName = $fullRoot
-if ($fullRoot.Length -gt 3) { $rootName = $probe.Name }
-$root = New-Folder $rootName $fullRoot 0
-$watch = [System.Diagnostics.Stopwatch]::StartNew()
-Write-Note "Scanning $fullRoot"
-
-$stack = New-Object System.Collections.Generic.Stack[object]
-$stack.Push(@{ Node = $root; Info = $probe })
+function Invoke-ScanRoot($Node, $Info) {
+  $stack = New-Object System.Collections.Generic.Stack[object]
+  $stack.Push(@{ Node = $Node; Info = $Info })
 
 while ($stack.Count -gt 0) {
   $frame = $stack.Pop()
@@ -303,16 +341,21 @@ while ($stack.Count -gt 0) {
         if ([string]::IsNullOrEmpty($ext)) { $ext = '(none)' } else { $ext = $ext.ToLowerInvariant() }
         Add-Stat $script:Ext $ext 1 $logical $alloc
         $modified = $file.LastWriteTimeUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
-        try { Add-Stat $script:Age (Get-AgeBucket $file.LastWriteTimeUtc) 1 $logical $alloc } catch { }
+        $bucket = $null
+        try { $bucket = Get-AgeBucket $file.LastWriteTimeUtc } catch { }
+        if ($bucket) { Add-Stat $script:Age $bucket 1 $logical $alloc }
         if ($logical -gt 0) {
-          Add-LargeFile ([ordered]@{
+          $fileRow = [ordered]@{
             path = $display
             name = $file.Name
             extension = $ext
             logicalBytes = $logical
             allocatedBytes = $alloc
             modifiedUtc = $modified
-          })
+          }
+          Add-LargeFile $fileRow
+          if ($bucket) { Add-AgeFile $bucket $fileRow }
+          Add-ExtFile $ext $fileRow
         }
         if ($Duplicates -and $logical -ge $DuplicateMinBytes) {
           $key = [string]$logical
@@ -353,6 +396,55 @@ while ($stack.Count -gt 0) {
     }
   } catch {
     Add-ScanError $node.Path $_.Exception.Message 'error'
+  }
+}
+
+}
+
+$targets = New-Object System.Collections.Generic.List[string]
+foreach ($item in @($Path)) {
+  foreach ($part in ([string]$item).Split(';')) {
+    $piece = $part.Trim()
+    if ($piece) { [void]$targets.Add($piece) }
+  }
+}
+if ($targets.Count -lt 1) {
+  Write-Host "Path is required."
+  exit 2
+}
+
+$watch = [System.Diagnostics.Stopwatch]::StartNew()
+$scanned = New-Object System.Collections.Generic.List[object]
+$fullPaths = New-Object System.Collections.Generic.List[string]
+foreach ($target in $targets) {
+  try {
+    $fullRoot = [System.IO.Path]::GetFullPath($target)
+  } catch {
+    Write-Host "Path is not valid: $target"
+    exit 2
+  }
+  $probe = New-Object System.IO.DirectoryInfo $fullRoot
+  if (-not $probe.Exists) {
+    Write-Host "Path not found or not a directory: $fullRoot"
+    exit 2
+  }
+  $rootName = $fullRoot
+  if ($fullRoot.Length -gt 3) { $rootName = $probe.Name }
+  $scannedRoot = New-Folder $rootName $fullRoot 0
+  Write-Note "Scanning $fullRoot"
+  Invoke-ScanRoot $scannedRoot $probe
+  [void]$scanned.Add($scannedRoot)
+  [void]$fullPaths.Add($fullRoot)
+}
+
+if ($scanned.Count -eq 1) {
+  $root = $scanned[0]
+} else {
+  $joined = ($fullPaths -join ' | ')
+  $root = New-Folder 'Scanned paths' $joined 0
+  foreach ($child in $scanned) {
+    Add-Depth $child 1
+    [void]$root.Children.Add($child)
   }
 }
 
@@ -472,11 +564,16 @@ foreach ($row in $duplicateRows) { $duplicateWaste += [int64]$row.wasteBytes }
 $extRows = New-Object System.Collections.Generic.List[object]
 foreach ($key in @($script:Ext.Keys)) {
   $row = $script:Ext[$key]
+  $extFiles = @()
+  if ($script:ExtFiles.ContainsKey([string]$key)) {
+    $extFiles = @($script:ExtFiles[[string]$key] | Sort-Object { [int64]$_.logicalBytes } -Descending)
+  }
   [void]$extRows.Add([ordered]@{
     extension = [string]$key
     fileCount = [int64]$row.fileCount
     logicalBytes = [int64]$row.logicalBytes
     allocatedBytes = [int64]$row.allocatedBytes
+    files = $extFiles
   })
 }
 $extSorted = @($extRows | Sort-Object { [int64]$_.logicalBytes } -Descending)
@@ -484,6 +581,10 @@ $extSorted = @($extRows | Sort-Object { [int64]$_.logicalBytes } -Descending)
 $ageOrder = @('0-7 days', '8-30 days', '31-90 days', '91-365 days', '1-3 years', 'Older than 3 years')
 $ageRows = New-Object System.Collections.Generic.List[object]
 foreach ($bucket in $ageOrder) {
+  $ageFiles = @()
+  if ($script:AgeFiles.ContainsKey($bucket)) {
+    $ageFiles = @($script:AgeFiles[$bucket] | Sort-Object { [int64]$_.logicalBytes } -Descending)
+  }
   if ($script:Age.ContainsKey($bucket)) {
     $row = $script:Age[$bucket]
     [void]$ageRows.Add([ordered]@{
@@ -491,6 +592,7 @@ foreach ($bucket in $ageOrder) {
       fileCount = [int64]$row.fileCount
       logicalBytes = [int64]$row.logicalBytes
       allocatedBytes = [int64]$row.allocatedBytes
+      files = $ageFiles
     })
   } else {
     [void]$ageRows.Add([ordered]@{
@@ -498,6 +600,7 @@ foreach ($bucket in $ageOrder) {
       fileCount = [int64]0
       logicalBytes = [int64]0
       allocatedBytes = [int64]0
+      files = $ageFiles
     })
   }
 }
@@ -553,15 +656,17 @@ $foldersSorted = @($topFolderRows | Sort-Object { [int64]$_.logicalBytes } -Desc
 $dupSorted = @($duplicateRows | Sort-Object { [int64]$_.wasteBytes } -Descending)
 
 Write-Note "Building JSON tree..."
+if ($scanned.Count -gt 1) { $ExportDepth = $ExportDepth + 1 }
 $tree = New-ExportNode $root 0
 
 $report = [ordered]@{
   kind = 'scan'
-  tool = 'SizeTree.PowerShell'
+  tool = 'disk-space-analysis.powershell'
   version = '1.0'
   scannedAt = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
   host = [string]$env:COMPUTERNAME
-  root = $fullRoot
+  root = [string]$root.Path
+  roots = @($fullPaths)
   elapsedMs = [int64]$watch.ElapsedMilliseconds
   summary = [ordered]@{
     logicalBytes = [int64]$root.LogicalBytes
@@ -695,54 +800,72 @@ function Escape-Html([string]$Text) {
   return $Text.Replace('&', $amp).Replace('<', $lt).Replace('>', $gt)
 }
 
-function Write-HtmlFile([string]$Target) {
-  $sb = New-Object System.Text.StringBuilder
-  [void]$sb.AppendLine('<!DOCTYPE html><html><head><meta charset="utf-8"><title>SizeTree report</title>')
-  [void]$sb.AppendLine('<style>body{font-family:Segoe UI,sans-serif;margin:24px;color:#1c1914;background:#f6f3ec}table{border-collapse:collapse;width:100%;margin:12px 0 28px}td,th{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left;font-size:13px}th{font-size:12px;color:#666}h1{font-size:22px}h2{font-size:16px;margin-top:28px}.mono{font-family:Consolas,monospace}</style></head><body>')
-  [void]$sb.AppendLine('<h1>SizeTree report</h1>')
-  [void]$sb.AppendLine('<p class="mono">' + (Escape-Html $fullRoot) + ' on ' + (Escape-Html ([string]$env:COMPUTERNAME)) + '</p>')
-  [void]$sb.AppendLine('<p>Logical ' + (Format-Byte ([int64]$root.LogicalBytes)) + ' | Allocated ' + (Format-Byte ([int64]$root.AllocatedBytes)) + ' | Files ' + ('{0:n0}' -f [int64]$root.FileCount) + ' | Folders ' + ('{0:n0}' -f [int64]$root.FolderCount) + ' | Duplicate waste ' + (Format-Byte $duplicateWaste) + '</p>')
-  [void]$sb.AppendLine('<h2>Largest folders</h2><table><tr><th>Path</th><th>Logical</th><th>Files</th></tr>')
-  $shown = 0
-  foreach ($row in $foldersSorted) {
-    if ($shown -ge 40) { break }
-    [void]$sb.AppendLine('<tr><td class="mono">' + (Escape-Html ([string]$row.path)) + '</td><td>' + (Format-Byte ([int64]$row.logicalBytes)) + '</td><td>' + $row.fileCount + '</td></tr>')
-    $shown++
+function Write-HtmlFile([string]$Target, [string]$Json) {
+  $templatePath = Join-Path $PSScriptRoot 'viewer.html'
+  $safe = $Json.Replace('<', '\u003c').Replace('>', '\u003e').Replace('&', '\u0026')
+  $embed = '<script id="disk-space-analysis-embed" type="application/json">' + $safe + '</script>'
+  if (Test-Path -LiteralPath $templatePath) {
+    $template = [System.IO.File]::ReadAllText($templatePath)
+    if ($template.Contains('<!--DISK_SPACE_ANALYSIS_EMBED-->')) {
+      $html = $template.Replace('<!--DISK_SPACE_ANALYSIS_EMBED-->', $embed)
+    } else {
+      $html = $template
+    }
+  } else {
+    $html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>disk-space-analysis</title></head><body><p>viewer.html was not next to the script.</p>' + $embed + '</body></html>'
   }
-  [void]$sb.AppendLine('</table><h2>Largest files</h2><table><tr><th>Path</th><th>Logical</th><th>Modified</th></tr>')
-  $shown = 0
-  foreach ($row in $filesSorted) {
-    if ($shown -ge 40) { break }
-    [void]$sb.AppendLine('<tr><td class="mono">' + (Escape-Html ([string]$row.path)) + '</td><td>' + (Format-Byte ([int64]$row.logicalBytes)) + '</td><td>' + (Escape-Html ([string]$row.modifiedUtc)) + '</td></tr>')
-    $shown++
-  }
-  [void]$sb.AppendLine('</table><h2>Extensions</h2><table><tr><th>Extension</th><th>Logical</th><th>Files</th></tr>')
-  $shown = 0
-  foreach ($row in $extSorted) {
-    if ($shown -ge 30) { break }
-    [void]$sb.AppendLine('<tr><td class="mono">' + (Escape-Html ([string]$row.extension)) + '</td><td>' + (Format-Byte ([int64]$row.logicalBytes)) + '</td><td>' + $row.fileCount + '</td></tr>')
-    $shown++
-  }
-  [void]$sb.AppendLine('</table></body></html>')
   $utf8 = New-Object System.Text.UTF8Encoding $false
-  [System.IO.File]::WriteAllText($Target, $sb.ToString(), $utf8)
+  [System.IO.File]::WriteAllText($Target, $html, $utf8)
 }
 
 [void][System.IO.Directory]::CreateDirectory($OutDir)
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$jsonBuilder = New-Object System.Text.StringBuilder
+Append-Json $jsonBuilder $report
+$jsonText = $jsonBuilder.ToString()
 $writeJson = $Format -eq 'All' -or $Format -eq 'Json'
 $writeCsv = $Format -eq 'All' -or $Format -eq 'Csv'
 $writeHtml = $Format -eq 'All' -or $Format -eq 'Html'
 
 if ($writeJson) {
-  Write-JsonFile (Join-Path $OutDir 'latest.json') $report
-  Write-JsonFile (Join-Path $OutDir ("sizetree-$stamp.json")) $report
+  $utf8 = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllText((Join-Path $OutDir 'latest.json'), $jsonText, $utf8)
+  [System.IO.File]::WriteAllText((Join-Path $OutDir ("disk-space-analysis-$stamp.json")), $jsonText, $utf8)
 }
 if ($writeCsv) {
   $folderHeaders = @('path', 'name', 'logicalBytes', 'allocatedBytes', 'fileCount', 'folderCount', 'depth')
   $fileHeaders = @('path', 'name', 'extension', 'logicalBytes', 'allocatedBytes', 'modifiedUtc')
   $extHeaders = @('extension', 'fileCount', 'logicalBytes', 'allocatedBytes')
+  $extFileHeaders = @('extension', 'path', 'name', 'logicalBytes', 'allocatedBytes', 'modifiedUtc')
+  $extFileRows = New-Object System.Collections.Generic.List[object]
+  foreach ($row in $extSorted) {
+    foreach ($file in @($row.files)) {
+      [void]$extFileRows.Add([ordered]@{
+        extension = [string]$row.extension
+        path = [string]$file.path
+        name = [string]$file.name
+        logicalBytes = [int64]$file.logicalBytes
+        allocatedBytes = [int64]$file.allocatedBytes
+        modifiedUtc = [string]$file.modifiedUtc
+      })
+    }
+  }
   $ageHeaders = @('bucket', 'fileCount', 'logicalBytes', 'allocatedBytes')
+  $ageFileHeaders = @('bucket', 'path', 'name', 'extension', 'logicalBytes', 'allocatedBytes', 'modifiedUtc')
+  $ageFileRows = New-Object System.Collections.Generic.List[object]
+  foreach ($row in $ageRows) {
+    foreach ($file in @($row.files)) {
+      [void]$ageFileRows.Add([ordered]@{
+        bucket = [string]$row.bucket
+        path = [string]$file.path
+        name = [string]$file.name
+        extension = [string]$file.extension
+        logicalBytes = [int64]$file.logicalBytes
+        allocatedBytes = [int64]$file.allocatedBytes
+        modifiedUtc = [string]$file.modifiedUtc
+      })
+    }
+  }
   $dupHeaders = @('match', 'hash', 'logicalBytes', 'count', 'wasteBytes', 'paths')
   $errHeaders = @('path', 'message')
   $dupCsv = New-Object System.Collections.Generic.List[object]
@@ -761,14 +884,16 @@ if ($writeCsv) {
   Write-CsvFile (Join-Path $OutDir 'latest-folders.csv') $folderHeaders $folderFlat
   Write-CsvFile (Join-Path $OutDir 'latest-files.csv') $fileHeaders $filesSorted
   Write-CsvFile (Join-Path $OutDir 'latest-extensions.csv') $extHeaders $extSorted
+  Write-CsvFile (Join-Path $OutDir 'latest-extension-files.csv') $extFileHeaders $extFileRows
   Write-CsvFile (Join-Path $OutDir 'latest-ages.csv') $ageHeaders $ageRows
+  Write-CsvFile (Join-Path $OutDir 'latest-age-files.csv') $ageFileHeaders $ageFileRows
   Write-CsvFile (Join-Path $OutDir 'latest-duplicates.csv') $dupHeaders $dupCsv
   Write-CsvFile (Join-Path $OutDir 'latest-errors.csv') $errHeaders $script:Errors
-  Write-CsvFile (Join-Path $OutDir ("sizetree-$stamp-folders.csv")) $folderHeaders $folderFlat
+  Write-CsvFile (Join-Path $OutDir ("disk-space-analysis-$stamp-folders.csv")) $folderHeaders $folderFlat
 }
 if ($writeHtml) {
-  Write-HtmlFile (Join-Path $OutDir 'latest.html')
-  Write-HtmlFile (Join-Path $OutDir ("sizetree-$stamp.html"))
+  Write-HtmlFile (Join-Path $OutDir 'latest.html') $jsonText
+  Write-HtmlFile (Join-Path $OutDir ("disk-space-analysis-$stamp.html")) $jsonText
 }
 
 Write-Note ("Done in {0:n1}s. Logical {1}. Files {2:n0}. Denied {3}. Reports in {4}" -f $watch.Elapsed.TotalSeconds, (Format-Byte ([int64]$root.LogicalBytes)), [int64]$root.FileCount, $script:Denied, (Resolve-Path $OutDir))

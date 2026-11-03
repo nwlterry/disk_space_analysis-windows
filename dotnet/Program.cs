@@ -44,7 +44,7 @@ int Run(string[] argv)
     {
         "scan" => Scan(opts),
         "compare" => Compare(opts),
-        _ => throw new InvalidOperationException("Unknown command. Use: SizeTree scan | compare")
+        _ => throw new InvalidOperationException("Unknown command. Use: disk-space-analysis scan | compare")
     };
 }
 
@@ -75,8 +75,9 @@ bool Flag(Dictionary<string, List<string>> opts, string key) =>
 
 int Scan(Dictionary<string, List<string>> opts)
 {
-    var path = Opt(opts, "path") ?? throw new InvalidOperationException("scan requires --path <directory>");
-    var outDir = Opt(opts, "out") ?? "SizeTreeReports";
+    if (!opts.TryGetValue("path", out var pathArgs) || pathArgs.Count == 0)
+        throw new InvalidOperationException("scan requires --path <directory>. Repeat --path for more than one.");
+    var outDir = Opt(opts, "out") ?? "disk-space-analysis-reports";
     var topFiles = Math.Max(1, ParseInt(Opt(opts, "top-files"), 200));
     var topFolders = Math.Max(1, ParseInt(Opt(opts, "top-folders"), 500));
     var depth = ParseInt(Opt(opts, "depth"), 0);
@@ -89,23 +90,13 @@ int Scan(Dictionary<string, List<string>> opts)
     var minDup = ParseLong(Opt(opts, "min-dup-bytes"), 50L * 1024 * 1024);
     if (minDup < 256 * 1024) minDup = 256 * 1024;
     var exclude = SplitPatterns(opts);
-
-    var fullRoot = Path.GetFullPath(path);
-    var rootInfo = new DirectoryInfo(fullRoot);
-    if (!rootInfo.Exists)
-    {
-        Console.Error.WriteLine("Path not found or not a directory: " + fullRoot);
-        return 2;
-    }
-
     var state = new ScanState(topFiles, topFolders, duplicates, minDup);
-    var rootName = fullRoot.Length <= 3 ? fullRoot : rootInfo.Name;
-    var root = new FolderNode { Name = rootName, Path = fullRoot, Depth = 0 };
     var started = System.Diagnostics.Stopwatch.StartNew();
-    if (!quiet) Console.WriteLine("Scanning " + fullRoot);
 
+    void Walk(FolderNode walkRoot, DirectoryInfo walkInfo)
+    {
     var stack = new Stack<(FolderNode Node, DirectoryInfo Info)>();
-    stack.Push((root, rootInfo));
+    stack.Push((walkRoot, walkInfo));
     var enumOptions = new EnumerationOptions
     {
         RecurseSubdirectories = false,
@@ -135,12 +126,14 @@ int Scan(Dictionary<string, List<string>> opts)
                     node.DirectFiles++;
                     var ext = string.IsNullOrEmpty(file.Extension) ? "(none)" : file.Extension.ToLowerInvariant();
                     AddExt(state, ext, logical, alloc);
-                    string modified;
+                    string modified = "";
+                    string bucket = "";
                     try
                     {
                         var utc = file.LastWriteTimeUtc;
                         modified = utc.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
-                        AddAge(state, AgeBucket(utc), logical, alloc);
+                        bucket = AgeBucket(utc);
+                        AddAge(state, bucket, logical, alloc);
                     }
                     catch
                     {
@@ -148,7 +141,7 @@ int Scan(Dictionary<string, List<string>> opts)
                     }
                     if (logical > 0)
                     {
-                        state.ConsiderFile(new FileRow
+                        var row = new FileRow
                         {
                             Path = display,
                             Name = file.Name,
@@ -156,7 +149,10 @@ int Scan(Dictionary<string, List<string>> opts)
                             LogicalBytes = logical,
                             AllocatedBytes = alloc,
                             ModifiedUtc = modified
-                        });
+                        };
+                        state.ConsiderFile(row);
+                        if (bucket.Length > 0) state.ConsiderAgeFile(bucket, row);
+                        state.ConsiderExtFile(ext, row);
                     }
                     if (duplicates && logical >= minDup)
                         state.AddDup(logical, display);
@@ -202,6 +198,50 @@ int Scan(Dictionary<string, List<string>> opts)
             state.AddError(node.Path, ex.Message, reparse: false);
         }
     }
+    }
+
+    var requested = ExpandPaths(pathArgs);
+    if (requested.Count == 0)
+        throw new InvalidOperationException("scan requires --path <directory>. Repeat --path for more than one.");
+    var scanned = new List<FolderNode>();
+    var fullPaths = new List<string>();
+    foreach (var requestedPath in requested)
+    {
+        string fullRoot;
+        try { fullRoot = Path.GetFullPath(requestedPath); }
+        catch
+        {
+            Console.Error.WriteLine("Path is not valid: " + requestedPath);
+            return 2;
+        }
+        var rootInfo = new DirectoryInfo(fullRoot.Length >= 240 ? ToLongPath(fullRoot) : fullRoot);
+        if (!rootInfo.Exists)
+        {
+            Console.Error.WriteLine("Path not found or not a directory: " + fullRoot);
+            return 2;
+        }
+        var rootName = fullRoot.Length <= 3 ? fullRoot : new DirectoryInfo(fullRoot).Name;
+        var scannedRoot = new FolderNode { Name = rootName, Path = fullRoot, Depth = 0 };
+        if (!quiet) Console.WriteLine("Scanning " + fullRoot);
+        Walk(scannedRoot, rootInfo);
+        scanned.Add(scannedRoot);
+        fullPaths.Add(fullRoot);
+    }
+
+    FolderNode root;
+    if (scanned.Count == 1)
+    {
+        root = scanned[0];
+    }
+    else
+    {
+        root = new FolderNode { Name = "Scanned paths", Path = string.Join(" | ", fullPaths), Depth = 0 };
+        foreach (var child in scanned)
+        {
+            ShiftDepth(child, 1);
+            root.Children.Add(child);
+        }
+    }
 
     if (!quiet) Console.WriteLine("Rolling up folder sizes...");
     Rollup(root);
@@ -220,7 +260,8 @@ int Scan(Dictionary<string, List<string>> opts)
     {
         ScannedAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture),
         Host = Environment.MachineName,
-        Root = fullRoot,
+        Root = root.Path,
+        Roots = fullPaths,
         ElapsedMs = (long)started.Elapsed.TotalMilliseconds,
         Summary = new Summary
         {
@@ -234,10 +275,17 @@ int Scan(Dictionary<string, List<string>> opts)
             DuplicateWasteBytes = dupRows.Sum(row => row.WasteBytes),
             AllocatedCollected = allocated
         },
-        Tree = ExportNode(root, 0, exportDepth, maxChildren),
+        Tree = ExportNode(root, 0, scanned.Count > 1 ? exportDepth + 1 : exportDepth, maxChildren),
         LargestFolders = state.TopFolders().OrderByDescending(row => row.LogicalBytes).ToList(),
         LargestFiles = state.TopFiles().OrderByDescending(row => row.LogicalBytes).ToList(),
-        Extensions = state.Extensions.OrderByDescending(row => row.LogicalBytes).ToList(),
+        Extensions = state.Extensions
+            .Select(row =>
+            {
+                row.Files = state.TakeExtFiles(row.Extension);
+                return row;
+            })
+            .OrderByDescending(row => row.LogicalBytes)
+            .ToList(),
         Ages = OrderedAges(state),
         Duplicates = dupRows,
         Errors = state.Errors
@@ -247,25 +295,43 @@ int Scan(Dictionary<string, List<string>> opts)
     var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
     var json = JsonSerializer.Serialize(report, jsonOptions);
     File.WriteAllText(Path.Combine(outDir, "latest.json"), json, new UTF8Encoding(false));
-    File.WriteAllText(Path.Combine(outDir, $"sizetree-{stamp}.json"), json, new UTF8Encoding(false));
+    File.WriteAllText(Path.Combine(outDir, $"disk-space-analysis-{stamp}.json"), json, new UTF8Encoding(false));
     WriteFoldersCsv(Path.Combine(outDir, "latest-folders.csv"), root);
-    WriteFoldersCsv(Path.Combine(outDir, $"sizetree-{stamp}-folders.csv"), root);
+    WriteFoldersCsv(Path.Combine(outDir, $"disk-space-analysis-{stamp}-folders.csv"), root);
     WriteFilesCsv(Path.Combine(outDir, "latest-files.csv"), report.LargestFiles);
     WriteSimpleCsv(Path.Combine(outDir, "latest-extensions.csv"),
         ["extension", "fileCount", "logicalBytes", "allocatedBytes"],
         report.Extensions.Select(row => new[] { row.Extension, row.FileCount.ToString(CultureInfo.InvariantCulture), row.LogicalBytes.ToString(CultureInfo.InvariantCulture), row.AllocatedBytes.ToString(CultureInfo.InvariantCulture) }));
+    WriteSimpleCsv(Path.Combine(outDir, "latest-extension-files.csv"),
+        ["extension", "path", "name", "logicalBytes", "allocatedBytes", "modifiedUtc"],
+        report.Extensions.SelectMany(ext => ext.Files.Select(file => new[]
+        {
+            ext.Extension, file.Path, file.Name,
+            file.LogicalBytes.ToString(CultureInfo.InvariantCulture),
+            file.AllocatedBytes.ToString(CultureInfo.InvariantCulture),
+            file.ModifiedUtc
+        })));
     WriteSimpleCsv(Path.Combine(outDir, "latest-ages.csv"),
         ["bucket", "fileCount", "logicalBytes", "allocatedBytes"],
         report.Ages.Select(row => new[] { row.Bucket, row.FileCount.ToString(CultureInfo.InvariantCulture), row.LogicalBytes.ToString(CultureInfo.InvariantCulture), row.AllocatedBytes.ToString(CultureInfo.InvariantCulture) }));
+    WriteSimpleCsv(Path.Combine(outDir, "latest-age-files.csv"),
+        ["bucket", "path", "name", "extension", "logicalBytes", "allocatedBytes", "modifiedUtc"],
+        report.Ages.SelectMany(age => age.Files.Select(file => new[]
+        {
+            age.Bucket, file.Path, file.Name, file.Extension,
+            file.LogicalBytes.ToString(CultureInfo.InvariantCulture),
+            file.AllocatedBytes.ToString(CultureInfo.InvariantCulture),
+            file.ModifiedUtc
+        })));
     WriteSimpleCsv(Path.Combine(outDir, "latest-duplicates.csv"),
         ["match", "hash", "logicalBytes", "count", "wasteBytes", "paths"],
         report.Duplicates.Select(row => new[] { row.Match, row.Hash ?? "", row.LogicalBytes.ToString(CultureInfo.InvariantCulture), row.Count.ToString(CultureInfo.InvariantCulture), row.WasteBytes.ToString(CultureInfo.InvariantCulture), string.Join("|", row.Paths) }));
     WriteSimpleCsv(Path.Combine(outDir, "latest-errors.csv"),
         ["path", "message"],
         report.Errors.Select(row => new[] { row.Path, row.Message }));
-    var html = BuildHtml(report);
+    var html = BuildOfflineHtml(json);
     File.WriteAllText(Path.Combine(outDir, "latest.html"), html, new UTF8Encoding(false));
-    File.WriteAllText(Path.Combine(outDir, $"sizetree-{stamp}.html"), html, new UTF8Encoding(false));
+    File.WriteAllText(Path.Combine(outDir, $"disk-space-analysis-{stamp}.html"), html, new UTF8Encoding(false));
 
     if (!quiet)
     {
@@ -279,7 +345,7 @@ int Compare(Dictionary<string, List<string>> opts)
 {
     var beforePath = Opt(opts, "before") ?? throw new InvalidOperationException("compare requires --before <folders.csv or .json>");
     var afterPath = Opt(opts, "after") ?? throw new InvalidOperationException("compare requires --after <folders.csv or .json>");
-    var outDir = Opt(opts, "out") ?? "SizeTreeCompare";
+    var outDir = Opt(opts, "out") ?? "disk-space-analysis-compare";
     var top = Math.Max(1, ParseInt(Opt(opts, "top"), 100));
     var minDelta = Math.Max(0, ParseLong(Opt(opts, "min-delta-bytes"), 1024 * 1024));
 
@@ -545,7 +611,12 @@ void AddAge(ScanState state, string bucket, long logical, long allocated)
 List<AgeRow> OrderedAges(ScanState state)
 {
     string[] order = ["0-7 days", "8-30 days", "31-90 days", "91-365 days", "1-3 years", "Older than 3 years"];
-    return order.Select(bucket => state.AgeMap.GetValueOrDefault(bucket) ?? new AgeRow { Bucket = bucket }).ToList();
+    return order.Select(bucket =>
+    {
+        var row = state.AgeMap.GetValueOrDefault(bucket) ?? new AgeRow { Bucket = bucket };
+        row.Files = state.TakeAgeFiles(bucket);
+        return row;
+    }).ToList();
 }
 
 string AgeBucket(DateTime utc)
@@ -730,30 +801,43 @@ List<Dictionary<string, string>> ReadCsv(string file)
     return result;
 }
 
-string BuildHtml(ScanReport report)
+string BuildOfflineHtml(string json)
 {
-    var sb = new StringBuilder();
-    sb.Append("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>SizeTree report</title>");
-    sb.Append("<style>body{font-family:Segoe UI,sans-serif;margin:24px;color:#1c1914;background:#f6f3ec}table{border-collapse:collapse;width:100%;margin:12px 0 28px}td,th{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left;font-size:13px}th{font-size:12px;color:#666}h1{font-size:22px}.mono{font-family:Consolas,monospace}</style></head><body>");
-    sb.Append("<h1>SizeTree report</h1><p class=\"mono\">").Append(Html(report.Root)).Append(" on ").Append(Html(report.Host)).Append("</p>");
-    sb.Append("<p>Logical ").Append(FormatBytes(report.Summary.LogicalBytes))
-        .Append(" · Allocated ").Append(FormatBytes(report.Summary.AllocatedBytes))
-        .Append(" · Files ").Append(report.Summary.FileCount.ToString("n0", CultureInfo.InvariantCulture))
-        .Append(" · Duplicate waste ").Append(FormatBytes(report.Summary.DuplicateWasteBytes)).Append("</p>");
-    sb.Append("<h2>Largest folders</h2><table><tr><th>Path</th><th>Logical</th><th>Files</th></tr>");
-    foreach (var row in report.LargestFolders.Take(40))
-        sb.Append("<tr><td class=\"mono\">").Append(Html(row.Path)).Append("</td><td>").Append(FormatBytes(row.LogicalBytes)).Append("</td><td>").Append(row.FileCount).Append("</td></tr>");
-    sb.Append("</table><h2>Largest files</h2><table><tr><th>Path</th><th>Logical</th><th>Modified</th></tr>");
-    foreach (var row in report.LargestFiles.Take(40))
-        sb.Append("<tr><td class=\"mono\">").Append(Html(row.Path)).Append("</td><td>").Append(FormatBytes(row.LogicalBytes)).Append("</td><td>").Append(Html(row.ModifiedUtc)).Append("</td></tr>");
-    sb.Append("</table></body></html>");
-    return sb.ToString();
+    var template = LoadViewerTemplate();
+    var safe = json.Replace("<", "\\u003c", StringComparison.Ordinal).Replace(">", "\\u003e", StringComparison.Ordinal).Replace("&", "\\u0026", StringComparison.Ordinal);
+    var embed = "<script id=\"disk-space-analysis-embed\" type=\"application/json\">" + safe + "</script>";
+    if (template.Contains("<!--DISK_SPACE_ANALYSIS_EMBED-->", StringComparison.Ordinal))
+        return template.Replace("<!--DISK_SPACE_ANALYSIS_EMBED-->", embed, StringComparison.Ordinal);
+    return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>disk-space-analysis</title></head><body><p>Place viewer.html next to disk-space-analysis.exe.</p>" + embed + "</body></html>";
 }
 
-string Html(string? text)
+string LoadViewerTemplate()
 {
-    var value = text ?? "";
-    return value.Replace("&", "&" + "amp;").Replace("<", "&" + "lt;").Replace(">", "&" + "gt;");
+    var beside = Path.Combine(AppContext.BaseDirectory, "viewer.html");
+    if (File.Exists(beside)) return File.ReadAllText(beside);
+    using var stream = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("disk-space-analysis.viewer.html");
+    if (stream == null) return "";
+    using var reader = new StreamReader(stream);
+    return reader.ReadToEnd();
+}
+
+List<string> ExpandPaths(List<string> args)
+{
+    var paths = new List<string>();
+    foreach (var arg in args)
+    {
+        foreach (var part in arg.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (part.Length > 0) paths.Add(part);
+        }
+    }
+    return paths;
+}
+
+void ShiftDepth(FolderNode node, int delta)
+{
+    node.Depth += delta;
+    foreach (var child in node.Children) ShiftDepth(child, delta);
 }
 
 string FormatBytes(long number)
@@ -770,14 +854,14 @@ string FormatBytes(long number)
 void PrintHelp()
 {
     Console.WriteLine("""
-        SizeTree 1.0 — disk space analysis for Windows Server
+        disk-space-analysis 1.0 — disk space analysis for Windows Server
 
-          SizeTree scan --path D:\ --out C:\SizeTreeReports --duplicates --hash --allocated
-          SizeTree compare --before older-folders.csv --after latest-folders.csv --out C:\SizeTreeReports\compare
+          disk-space-analysis scan --path D:\ --path E:\Data --out C:\disk-space-analysis-reports --duplicates --hash --allocated
+          disk-space-analysis compare --before older-folders.csv --after latest-folders.csv --out C:\disk-space-analysis-reports\compare
 
         scan
-          --path <dir>            Folder, volume, or UNC path
-          --out <dir>             Report folder (default SizeTreeReports)
+          --path <dir>            Folder, volume, or UNC path. Repeat for more than one. Semicolons also split a value.
+          --out <dir>             Report folder (default disk-space-analysis-reports)
           --top-files <n>         Largest files kept (default 200)
           --top-folders <n>       Largest folders kept in JSON (default 500)
           --depth <n>             Directory levels to descend (0 = all)
@@ -790,7 +874,7 @@ void PrintHelp()
           --exclude <pattern>     Name or wildcard. Repeat, or separate with semicolons
           --quiet
 
-        compare reads folders.csv or a scan JSON. Open latest.json or compare.json in the SizeTree viewer.
+        compare reads folders.csv or a scan JSON. Open latest.json in the disk-space-analysis viewer, or double-click latest.html for the same screen offline.
 
         Publish:
           dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
@@ -803,6 +887,10 @@ sealed class ScanState
     readonly int _topFolders;
     readonly PriorityQueue<FileRow, long> _files = new();
     readonly PriorityQueue<FolderRow, long> _folders = new();
+    readonly Dictionary<string, PriorityQueue<FileRow, long>> _ageFiles = new(StringComparer.Ordinal);
+    readonly Dictionary<string, PriorityQueue<FileRow, long>> _extFiles = new(StringComparer.OrdinalIgnoreCase);
+    const int AgeFileCap = 40;
+    const int ExtFileCap = 40;
 
     public ScanState(int topFiles, int topFolders, bool duplicates, long minDup)
     {
@@ -831,6 +919,48 @@ sealed class ScanState
             _files.Dequeue();
             _files.Enqueue(row, row.LogicalBytes);
         }
+    }
+
+    public void ConsiderAgeFile(string bucket, FileRow row)
+    {
+        if (!_ageFiles.TryGetValue(bucket, out var heap))
+            _ageFiles[bucket] = heap = new PriorityQueue<FileRow, long>();
+        if (heap.Count < AgeFileCap) heap.Enqueue(row, row.LogicalBytes);
+        else if (row.LogicalBytes > heap.Peek().LogicalBytes)
+        {
+            heap.Dequeue();
+            heap.Enqueue(row, row.LogicalBytes);
+        }
+    }
+
+    public List<FileRow> TakeAgeFiles(string bucket)
+    {
+        if (!_ageFiles.TryGetValue(bucket, out var heap)) return [];
+        var list = new List<FileRow>();
+        while (heap.Count > 0) list.Add(heap.Dequeue());
+        list.Sort((a, b) => b.LogicalBytes.CompareTo(a.LogicalBytes));
+        return list;
+    }
+
+    public void ConsiderExtFile(string extension, FileRow row)
+    {
+        if (!_extFiles.TryGetValue(extension, out var heap))
+            _extFiles[extension] = heap = new PriorityQueue<FileRow, long>();
+        if (heap.Count < ExtFileCap) heap.Enqueue(row, row.LogicalBytes);
+        else if (row.LogicalBytes > heap.Peek().LogicalBytes)
+        {
+            heap.Dequeue();
+            heap.Enqueue(row, row.LogicalBytes);
+        }
+    }
+
+    public List<FileRow> TakeExtFiles(string extension)
+    {
+        if (!_extFiles.TryGetValue(extension, out var heap)) return [];
+        var list = new List<FileRow>();
+        while (heap.Count > 0) list.Add(heap.Dequeue());
+        list.Sort((a, b) => b.LogicalBytes.CompareTo(a.LogicalBytes));
+        return list;
     }
 
     public void ConsiderFolder(FolderNode node)
@@ -955,11 +1085,12 @@ sealed class FolderMeasure
 sealed class ScanReport
 {
     public string Kind { get; set; } = "scan";
-    public string Tool { get; set; } = "SizeTree.DotNet";
+    public string Tool { get; set; } = "disk-space-analysis.dotnet";
     public string Version { get; set; } = "1.0";
     public string ScannedAt { get; set; } = "";
     public string Host { get; set; } = "";
     public string Root { get; set; } = "";
+    public List<string> Roots { get; set; } = [];
     public long ElapsedMs { get; set; }
     public Summary Summary { get; set; } = new();
     public FolderDto Tree { get; set; } = new();
@@ -1021,6 +1152,7 @@ sealed class ExtRow
     public long FileCount { get; set; }
     public long LogicalBytes { get; set; }
     public long AllocatedBytes { get; set; }
+    public List<FileRow> Files { get; set; } = [];
 }
 
 sealed class AgeRow
@@ -1029,6 +1161,7 @@ sealed class AgeRow
     public long FileCount { get; set; }
     public long LogicalBytes { get; set; }
     public long AllocatedBytes { get; set; }
+    public List<FileRow> Files { get; set; } = [];
 }
 
 sealed class DupRow
@@ -1050,7 +1183,7 @@ sealed class ErrRow
 sealed class CompareReport
 {
     public string Kind { get; set; } = "compare";
-    public string Tool { get; set; } = "SizeTree.DotNet";
+    public string Tool { get; set; } = "disk-space-analysis.dotnet";
     public string Version { get; set; } = "1.0";
     public string GeneratedAt { get; set; } = "";
     public CompareSide Before { get; set; } = new();
