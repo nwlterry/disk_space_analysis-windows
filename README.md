@@ -15,3 +15,9 @@ This repo keeps a copy of both sources at v1.0.0-beta.1. The executable is on th
 ```
 
 `latest.html` opens the scan with no network. Files, Types, and Age list the matching files, and the file name uses most of the row.
+
+## Log
+
+Each run prints `yyyy-MM-dd HH:mm:ss` on every console line and appends the same lines to `disk-space-analysis.log` in the report folder.
+
+PowerShell: `-EventLog`. .NET: `--event-log`. That also writes the start, errors, and the summary to the Windows Application log. The source name is `disk-space-analysis`. The first use must run elevated so Windows can register the source. `-Quiet` / `--quiet` hides console progress. The log file is still written. The periodic file-count lines stay in the console and the log file, not the event log.
